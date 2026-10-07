@@ -1,6 +1,11 @@
 using NAPS2.WebScan.LocalService;
 
-var builder = Host.CreateApplicationBuilder(args);
+var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory,
+});
+
 builder.Services.AddWindowsService(options =>
 {
     options.ServiceName = "NAPS2.WebScan Service";
