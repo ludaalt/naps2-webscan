@@ -18,7 +18,7 @@ public class Worker : BackgroundService
     // Таймаут проверки сетевого МФУ по eSCL
     private static readonly TimeSpan NetworkProbeTimeout = TimeSpan.FromSeconds(3);
 
-    // Сколько ждать ответы SSDP при авто-поиске сетевых eSCL-сканеров (мс)
+    // Сколько ждать ответы при авто-поиске сетевых eSCL-сканеров (мс)
     private static readonly TimeSpan NetworkDiscoveryTimeout = TimeSpan.FromSeconds(5);
 
     // Первый порт, с которого начинается раздача сканеров по eSCL
@@ -47,21 +47,46 @@ public class Worker : BackgroundService
     };
 
     private readonly ILogger<Worker> _logger;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly IConfiguration _configuration;
 
-    public Worker(ILogger<Worker> logger)
+    // Последнее число найденных устройств: авто-поиск идёт раз в 15 с, и чаще
+    // всего результат не меняется - одинаковые значения в журнал не пишем
+    private int _lastDiscoveredCount = -1;
+
+    // Причина последнего сбоя авто-поиска (сеть и WIA): одинаковую ошибку
+    // пишем подробно один раз, повторы только на уровне Trace
+    private string? _lastNetworkFailure;
+    private string? _lastWiaFailure;
+
+    public Worker(ILogger<Worker> logger, ILoggerFactory loggerFactory, IConfiguration configuration)
     {
         _logger = logger;
+        _loggerFactory = loggerFactory;
+        _configuration = configuration;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var scanningContext = new ScanningContext(new ImageSharpImageContext());
+        _logger.LogInformation("Служба запущена");
+        _logger.LogInformation("Журнал службы: {Directories} (хранение {Days} дн.)",
+            string.Join("; ", FileLoggerProvider.GetLogDirectories()),
+            FileLoggerProvider.GetRetentionDays(_configuration));
+
+        // Подключение NAPS2
+        // Логгер NAPS2 обязателен: без него причины ошибок сканирования
+        // (занятое устройство, обрыв связи, замятие) нигде не фиксируются
+        using var scanningContext = new ScanningContext(new ImageSharpImageContext())
+        {
+            Logger = _loggerFactory.CreateLogger("NAPS2.Scan")
+        };
         var controller = new ScanController(scanningContext);
 
         using var scanServer = new ScanServer(scanningContext, new EsclServer
         {
             // This line is required for scanning from a browser to work
-            SecurityPolicy = EsclSecurityPolicy.ServerAllowAnyOrigin
+            SecurityPolicy = EsclSecurityPolicy.ServerAllowAnyOrigin,
+            Logger = _loggerFactory.CreateLogger("NAPS2.Escl.Server")
         });
 
         // Каталог расшаренных сканеров: каждый сканер получает свой порт
@@ -120,12 +145,14 @@ public class Worker : BackgroundService
             {
                 await scanServer.Stop();
             }
+
+            _logger.LogInformation("Служба остановлена");
         }
     }
 
     /// <summary>
-    /// Собирает все доступные сканеры: сетевые eSCL-сканеры (МФУ) по SSDP
-    /// и локальные USB-сканеры (WIA). Дубли по ID отбрасываются.
+    /// Собирает все доступные сканеры: сетевые eSCL-сканеры (МФУ) и локальные
+    /// USB-сканеры (WIA). Дубли по ID отбрасываются.
     /// Сканеры, добавленные оператором по явному адресу, живут отдельно
     /// в каталоге и переживают исчезновение сети
     /// </summary>
@@ -150,13 +177,21 @@ public class Worker : BackgroundService
             }
         }
 
+        // пишем только при изменении количества
+        if (devices.Count != _lastDiscoveredCount)
+        {
+            _lastDiscoveredCount = devices.Count;
+            _logger.LogInformation("Авто-поиск: доступно устройств: {Count}", devices.Count);
+        }
         return devices;
     }
 
     /// <summary>
-    /// Авто-поиск сетевых eSCL-сканеров (МФУ) по SSDP в локальной сети
+    /// Авто-поиск сетевых eSCL-сканеров (МФУ) в локальной сети
     /// NAPS2 сам собирает список найденных устройств (имя и адрес каждого МФУ
     /// берутся из его eSCL-ответа)
+    /// Устройства из другой подсети/VLAN автоматически не находятся:
+    /// их можно добавить только по явному адресу (POST /devices)
     /// Возвращает все найденные устройства
     /// </summary>
     private async Task<List<ScanDevice>> FindNetworkDevicesByDiscoveryAsync(ScanController controller)
@@ -175,23 +210,16 @@ public class Worker : BackgroundService
             };
 
             var devices = await controller.GetDeviceList(options);
-            if (devices.Count == 0)
-            {
-                _logger.LogDebug("Сетевые eSCL-сканеры по SSDP не обнаружены (окно поиска {Timeout}), повторю позже",
-                    NetworkDiscoveryTimeout.TotalSeconds);
-                return new List<ScanDevice>();
-            }
-
-            foreach (var device in devices)
-            {
-                _logger.LogInformation("Обнаружен сетевой eSCL-сканер: {Name} ({Id})", device.Name, device.ID);
-            }
+            // Поиск отработал: если дальше случится сбой, он снова попадёт в журнал
+            _lastNetworkFailure = null;
+            // Каждое найденное устройство отдельно не логируем: каталог пишет
+            // "Раздаю сканер" один раз, когда устройство реально добавляется
             return devices.ToList();
         }
         catch (Exception ex)
         {
-            // SSDP может быть заблокирован брандмауэром/политикой - не роняем службу
-            _logger.LogDebug(ex, "Не удалось выполнить авто-поиск сетевых eSCL-сканеров");
+            // Авто-поиск может быть заблокирован брандмауэром/политикой - не роняем службу
+            LogRepeatedFailure(ref _lastNetworkFailure, "Не удалось выполнить авто-поиск сетевых eSCL-сканеров", ex);
             return new List<ScanDevice>();
         }
     }
@@ -202,23 +230,32 @@ public class Worker : BackgroundService
         try
         {
             var devices = await controller.GetDeviceList(Driver.Wia);
-            if (devices.Count == 0)
-            {
-                return new List<ScanDevice>();
-            }
-            foreach (var device in devices)
-            {
-                _logger.LogInformation("Локальный USB-сканер: {Name} (ID: {Id})", device.Name, device.ID);
-            }
+            _lastWiaFailure = null;
             return devices.ToList();
         }
         catch (Exception ex)
         {
             // WIA может быть недоступно (служба StiSvc не запущена) - это не
             // повод ронять службу сканирования, попробуем в следующем цикле
-            _logger.LogDebug(ex, "Не удалось получить список локальных WIA-сканеров");
+            LogRepeatedFailure(ref _lastWiaFailure, "Не удалось получить список локальных WIA-сканеров", ex);
             return new List<ScanDevice>();
         }
+    }
+
+    /// <summary>
+    /// Пишет ошибку подробно только когда её причина изменилась: авто-поиск идёт
+    /// раз в 15 с, и одинаковая ошибка иначе дублировалась бы со стеком в журнале
+    /// </summary>
+    private void LogRepeatedFailure(ref string? lastReason, string context, Exception ex)
+    {
+        var reason = $"{ex.GetType().Name}: {ex.Message}";
+        if (reason == lastReason)
+        {
+            _logger.LogTrace("{Context} (та же ошибка)", context);
+            return;
+        }
+        lastReason = reason;
+        _logger.LogDebug(ex, "{Context}", context);
     }
 
     /// <summary>Приводит URL к виду, который понимает EsclClient. Используется
@@ -242,7 +279,7 @@ public class Worker : BackgroundService
 /// повторных синхронизациях новые устройства добавляются, исчезнувшие
 /// убираются, порты за устройствами сохраняются
 ///
-/// Кроме автоматически найденных устройств (SSDP/WIA) каталог хранит
+/// Кроме автоматически найденных устройств (сеть/WIA) каталог хранит
 /// сканеры, добавленные оператором по явному адресу (POST /devices): их
 /// синхронизация не удаляет, а адреса сохраняются в custom-scanners.json
 /// рядом с исполняемым файлом и восстанавливаются при старте службы
@@ -261,7 +298,7 @@ internal sealed class SharedDeviceCatalog : IDisposable
     private readonly HttpClient _probeClient;
     private readonly string _customFile;
 
-    // Найденные автоматически (SSDP/WIA): каждую синхронизацию сверяются с сетью
+    // Найденные автоматически (сеть/WIA): каждую синхронизацию сверяются с сетью
     private readonly List<Entry> _entries = new();
 
     // Добавленные по адресу оператором: синхронизация их не трогает
@@ -270,6 +307,11 @@ internal sealed class SharedDeviceCatalog : IDisposable
     // Сохранённые адреса, которые были недоступны на момент (пере)запуска:
     // перепроверяются в каждом цикле синхронизации, пока не станут доступны
     private readonly List<string> _pendingUrls = new();
+
+    // Причина последней неудачной проверки по каждому адресу: одинаковую ошибку
+    // (например, один и тот же таймаут, пока МФУ в другой подсети) пишем
+    // только один раз, чтобы журнал не разрастался
+    private readonly Dictionary<string, string> _lastProbeFailure = new();
 
     private bool _started;
 
@@ -477,11 +519,24 @@ internal sealed class SharedDeviceCatalog : IDisposable
     {
         try
         {
-            return await _probeClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            var response = await _probeClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            // адрес снова отвечает: следующая ошибка опять будет показана подробно
+            _lastProbeFailure.Remove(url);
+            return response;
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Проверка доступности сканера не удалась: {Url}", url);
+            var reason = $"{ex.GetType().Name}: {ex.Message}";
+            if (_lastProbeFailure.TryGetValue(url, out var previous) && previous == reason)
+            {
+                // та же ошибка, что и в прошлый раз: подробности уже есть в журнале
+                _logger.LogTrace("Проверка доступности сканера снова не удалась: {Url}", url);
+            }
+            else
+            {
+                _lastProbeFailure[url] = reason;
+                _logger.LogDebug(ex, "Проверка доступности сканера не удалась: {Url}", url);
+            }
             return null;
         }
     }
@@ -563,7 +618,20 @@ internal sealed class DeviceListHttpServer : IDisposable
             _logger.LogWarning("Не удалось поднять управляющий HTTP-сервер списка сканеров на порту {Port}", _port);
             return;
         }
-        _listener.Start();
+
+        // Порт может быть занят другим экземпляром службы или посторонним
+        // процессом: без этой защиты HttpListener.Start() роняет всю службу
+        try
+        {
+            _listener.Start();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Не удалось запустить управляющий HTTP-сервер на порту {Port}: порт занят или нет прав", _port);
+            return;
+        }
+
         _cts = new CancellationTokenSource();
         _ = Task.Run(() => LoopAsync(_cts.Token));
         _logger.LogInformation("Список сканеров доступен: http://localhost:{Port}/devices", _port);
@@ -613,6 +681,9 @@ internal sealed class DeviceListHttpServer : IDisposable
     {
         try
         {
+            _logger.LogDebug("Запрос к службе сканирования: {Method} {Path}",
+                context.Request.HttpMethod, context.Request.Url?.AbsolutePath);
+
             if (context.Request.HttpMethod == "OPTIONS")
             {
                 // предзапрос CORS перед POST из браузера
