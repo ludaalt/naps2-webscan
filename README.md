@@ -1,37 +1,92 @@
-# NAPS2.WebScan
+# NAPS2.WebScan Service
 
-NAPS2.WebScan contains sample code for scanning from a web browser in JavaScript/TypeScript using [NAPS2.Sdk](https://www.naps2.com/sdk).
+Служба Windows, которая открывает браузеру доступ к сканерам, подключённым к
+компьютеру или доступным по сети. Браузер не умеет работать со сканером
+напрямую. Служба работает в фоне и «раздаёт» каждое устройство по
+протоколу eSCL, использующему HTTP-протокол, с которым браузер общается
+через `fetch`. Сайт обращается к службе на `http://localhost`,
+и пользователь сканирует прямо со страницы.
 
-## How does this work?
+Работает на Windows 10/11 x64, устанавливается от имени администратора.
 
-Consider a corporate network with an intranet site we want to add scanning capabilities to. Users will scan using a 
-scanner attached to their local machine and then upload it to the intranet server. 
+## Возможности
 
-- `NAPS2.WebScan.LocalService` is a Windows Service we would install on every client machine. It shares scanning devices attached to the local machine using ESCL, which is a [standard](https://mopria.org/mopria-escl-specification) HTTP protocol the browser can connect to.
-- `NAPS2.WebScan.WebServer` is an example web server with JS/TS client code for scanning (in practice you would integrate the code with your existing server).
+- **USB-сканеры**: через WIA, нужен WIA-совместимый драйвер
+- **Сетевые сканеры и МФУ**: авто-поиск по eSCL в своей подсети либо
+  добавление вручную по IP-адресу: `http://<ip>` (дополнение к пути `/eSCL` служба
+  добавляет сама)
+- **Несколько сканеров одновременно**: каждому выделяется свой порт, начиная
+  с `9880`
+- **Список устройств для браузера**: `GET http://localhost:9899/devices`
+- **Сохранение добавленных вручную сканеров**: `custom-scanners.json` рядом с
+  `exe`; недоступные адреса перепроверяются автоматически
+- **Журнал** в каталоге службы и в `%ProgramData%`
 
-Note that while the sample service code is designed for Windows, the concept can easily be extended cross-platform.
+## Как это работает
 
-## How do I build the JS/TS code?
+Служба запускается вместе с Windows (отложенный автозапуск) и зависит от двух
+системных служб:
 
-- `cd NAPS2.WebScan.WebServer`
-- `npm install`
-- `vite build`
+- `StiSvc` - служба образов Windows (Windows Image Acquisition, WIA). Через неё
+  служба получает доступ к USB-сканерам и их драйверам; без неё USB-устройства
+  не находятся.
+- `RpcSs` - служба удалённых вызовов процедур (RPC). От неё зависят диспетчер
+  служб Windows и обращение к устройствам.
 
-## Where's the interesting code?
+Раз в 15 секунд служба ищет сетевые eSCL-устройства и локальные USB-сканеры.
+Каждому найденному сканеру она выдаёт свободный порт (`9880`, `9881`, …) и
+поднимает на нём eSCL-сервер, а на порту `9899` отдаёт список сканеров и
+принимает добавление МФУ по адресу.
 
-- [Worker.cs](https://github.com/cyanfish/naps2-webscan/blob/master/NAPS2.WebScan.LocalService/Worker.cs) - Setting up the scanner-sharing server
-- [site.ts](https://github.com/cyanfish/naps2-webscan/blob/master/NAPS2.WebScan.WebServer/wwwroot/js/site.ts) - Scanning from JavaScript/TypeScript
-- [escl-sdk-ts](https://github.com/cyanfish/naps2-webscan/tree/master/NAPS2.WebScan.WebServer/wwwroot/lib/escl-sdk-ts) - Lightly modified version of the [escl-sdk-ts](https://www.npmjs.com/package/escl-sdk-ts) package used for the client
+Браузер проходит стандартный цикл eSCL - три запроса к eSCL-серверу сканера:
 
-## How do I set option X for scanning?
+1. `GET …/eSCL/ScannerCapabilities`: отдаёт возможности сканера: разрешения, режимы цвета, источники бумаги (планшет/автоподатчик), форматы
+2. `POST …/eSCL/ScanJobs`: создаёт задание сканирования. Тело: XML `scan:ScanSettings` (разрешение, цвет, источник). В ответе `201` и заголовок `Location` - адрес созданного задания
+3. `GET <Location>/NextDocument`: отдаёт очередную страницу (JPEG или PDF). `404` - страниц больше нет, `503` - страница ещё готовится, нужно повторить запрос
 
-Have a look at [IScanSettingParams](https://github.com/cyanfish/naps2-webscan/blob/4571e9c917edcc053f89aaeba047725529fdc7bf/NAPS2.WebScan.WebServer/wwwroot/lib/escl-sdk-ts/types/scanner.d.ts#L54) and the whole [types folder](https://github.com/cyanfish/naps2-webscan/tree/master/NAPS2.WebScan.WebServer/wwwroot/lib/escl-sdk-ts/types) for the type definitions. The [ESCL spec](https://mopria.org/mopria-escl-specification) may also be helpful.
+### Порты
 
-## How do I scan multiple pages from a feeder?
+| Порт              | Назначение                                          |
+| ----------------- | --------------------------------------------------- |
+| `9880`, `9881`, … | eSCL-сервер, по одному порту на сканер              |
+| `9899`            | Список сканеров и добавление по адресу (HTTP, CORS) |
 
-Keep calling `NextDocument` until it errors with a 404.
+### Данные службы
 
-## Still having trouble?
+| Что                         | Где                                                                     |
+| --------------------------- | ----------------------------------------------------------------------- |
+| Журнал №1                   | `<каталог службы>\logs\service-ГГГГ-ММ-ДД.log`                          |
+| Журнал №2                   | `%ProgramData%\NAPS2 WebScan Local Service\logs\service-ГГГГ-ММ-ДД.log` |
+| Добавленные вручную сканеры | `<каталог службы>\custom-scanners.json`                                 |
+| Настройки                   | `<каталог службы>\appsettings.json`                                     |
 
-Feel free to create [an issue](https://github.com/cyanfish/naps2-webscan/issues).
+Каталог службы при установке создаёт установщик:
+`C:\Program Files\NAPS2 WebScan Local Service`.
+
+## Основные файлы репозитория
+
+`NAPS2.WebScan.LocalService.csproj`: говорит .NET, что это служба под Windows x64, какие пакеты скачать и что нужен один `exe`
+`Program.cs` : создаёт хост, задаёт имя службы `NAPS2.WebScan Service`, подключает журнал и `Worker`
+`Worker.cs` : ищет USB-сканеры (WIA) и сетевые МФУ (eSCL), выдаёт каждому порт, раздаёт их по eSCL, отдаёт список на `9899`, сохраняет добавленные сканеры
+`FileLogger.cs` : пишет журнал в два каталога, по файлу на день, хранит 30 дней, не роняет службу при ошибке записи
+`appsettings.json` : уровни логирования и срок хранения журнала
+`installer.iss` : скрипт для Inno Setup: из `publish\` собирает основной установщик службы
+
+## Ограничения
+
+- Служба работает только по HTTP, без HTTPS. Сайт при этом может работать
+  по HTTPS: `http://localhost` и `http://127.0.0.1` браузеры считают доверенными адресами.
+- Авто-поиск сетевых устройств работает в пределах одной подсети. МФУ из другой
+  подсети добавляется вручную по IP-адресу.
+- USB-сканер должен иметь WIA-драйвер.
+
+## Документация
+
+Сборка, установка, проверка, подключение МФУ и использование из фронтенда в основной документации
+[docs/INSTRUCTION.md](docs/INSTRUCTION.md).
+
+## Лицензия
+
+MIT, см. [LICENSE](LICENSE). Проект основан на
+[NAPS2.WebScan](https://github.com/cyanfish/naps2-webscan) и использует
+[NAPS2.Sdk](https://www.naps2.com/sdk).

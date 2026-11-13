@@ -1,3 +1,21 @@
+// ============================================================================
+// Worker.cs: вся логика службы сканирования
+//
+// Что делает файл:
+//   1. Worker - главный цикл службы: раз в 15 секунд ищет сканеры и 
+//      держит список актуальным;
+//   2. ищет сетевые сканеры/МФУ по eSCL и локальные USB-сканеры через WIA;
+//   3. SharedDeviceCatalog раздаёт каждый найденный сканер на отдельном
+//      порту (9880, 9881, ...), хранит сканеры, добавленные по адресу,
+//      и сохраняет их в custom-scanners.json;
+//   4. DeviceListHttpServer - это HTTP-сервер на порту 9899:
+//      GET /devices - список сканеров для браузера,
+//      POST /devices - добавить сетевой сканер по адресу.
+//
+// В браузер сканеры отдаются по стандарту eSCL:
+// ScannerCapabilities -> ScanJobs -> NextDocument
+// ============================================================================
+
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -10,6 +28,10 @@ using NAPS2.Threading;
 
 namespace NAPS2.WebScan.LocalService;
 
+/// <summary>
+/// Главный цикл службы: находит сканеры, обновляет каталог раздачи и
+/// перепроверяет сохранённые адреса, пока служба не остановлена
+/// </summary>
 public class Worker : BackgroundService
 {
     // Пауза между попытками найти сканер, если сейчас его нет
@@ -66,6 +88,10 @@ public class Worker : BackgroundService
         _configuration = configuration;
     }
 
+    /// <summary>
+    /// Запуск службы: создаёт контекст NAPS2, eSCL-сервер, каталог сканеров и
+    /// управляющий HTTP-сервер, затем крутит цикл поиска устройств
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("Служба запущена");
@@ -258,8 +284,16 @@ public class Worker : BackgroundService
         _logger.LogDebug(ex, "{Context}", context);
     }
 
-    /// <summary>Приводит URL к виду, который понимает EsclClient. Используется
-    /// для адресов, введённых оператором в интерфейсе</summary>
+    /// <summary>
+    /// Приводит URL к виду, который понимает EsclClient. Используется для
+    /// адресов, введённых оператором в интерфейсе.
+    ///
+    /// Почему это нужно: путь eSCL у МФУ чувствителен к регистру. Запрос
+    /// <c>https://172.17.50.3/escl/ScannerCapabilities</c> возвращает 404,
+    /// а <c>https://172.17.50.3/eSCL/ScannerCapabilities</c> - 200. То же с
+    /// корнем устройства: без пути проверка попадёт в <c>/ScannerCapabilities</c>
+    /// и тоже получит 404. Поэтому адрес приводится к каноническому /eSCL
+    /// </summary>
     internal static string? NormalizeUrl(string? url)
     {
         url = url?.Trim();
@@ -267,9 +301,42 @@ public class Worker : BackgroundService
         {
             return null;
         }
+
         // EsclClient собирает адрес как "/{AbsolutePath}/{endpoint}", поэтому
         // завершающий слэш дал бы двойной слэш в пути и 404 на МФУ
-        return url.TrimEnd('/');
+        url = url.TrimEnd('/');
+
+        // Оператор мог вставить адрес вместе с конечной точкой
+        // (…/eSCL/ScannerCapabilities) - оставляем только корень eSCL
+        const string capabilitiesSuffix = "/ScannerCapabilities";
+        if (url.EndsWith(capabilitiesSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            url = url[..^capabilitiesSuffix.Length].TrimEnd('/');
+        }
+
+        // Отделяем схему с хостом от пути, чтобы не трогать регистр в адресе
+        // самого устройства (он тоже может быть чувствителен)
+        var schemeEnd = url.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0)
+        {
+            // Не абсолютный адрес: оставляем как есть, ошибку покажет проверка
+            return url;
+        }
+        var pathStart = url.IndexOf('/', schemeEnd + 3);
+        var authority = pathStart < 0 ? url : url[..pathStart];
+        var path = pathStart < 0 ? "" : url[pathStart..];
+
+        if (path.Length == 0)
+        {
+            // Введён только адрес МФУ (https://172.17.50.3) - eSCL живёт в /eSCL
+            return $"{authority}/eSCL";
+        }
+        if (string.Equals(path, "/escl", StringComparison.OrdinalIgnoreCase))
+        {
+            // Регистр пути: /escl, /ESCL, /eScl -> /eSCL
+            return $"{authority}/eSCL";
+        }
+        return url;
     }
 }
 
@@ -356,7 +423,12 @@ internal sealed class SharedDeviceCatalog : IDisposable
         }
         if (!response.IsSuccessStatusCode)
         {
-            return new AddDeviceResult(false, null, $"МФУ не отвечает: HTTP {(int)response.StatusCode}");
+            // 404 чаще всего значит неверный путь: у МФУ он /eSCL, и регистр важен
+            var hint = response.StatusCode == HttpStatusCode.NotFound
+                ? " (проверьте путь eSCL, обычно /eSCL)"
+                : "";
+            return new AddDeviceResult(false, null,
+                $"МФУ не отвечает: HTTP {(int)response.StatusCode}{hint}");
         }
 
         // Сканер с таким адресом уже раздаётся, не дублируем, вернём существующий
@@ -474,6 +546,11 @@ internal sealed class SharedDeviceCatalog : IDisposable
     private SharedDeviceInfo? FindByUrl(string url) =>
         Snapshot().FirstOrDefault(s => s.Id == url);
 
+    /// <summary>
+    /// Синхронизирует раздачу с результатами авто-поиска: убирает исчезнувшие
+    /// устройства, добавляет новые на свободные порты. Сканеры, добавленные по
+    /// адресу, не трогает
+    /// </summary>
     public async Task SyncAsync(List<ScanDevice> devices)
     {
         var newIds = devices.Select(d => d.ID).ToHashSet();
@@ -541,6 +618,10 @@ internal sealed class SharedDeviceCatalog : IDisposable
         }
     }
 
+    /// <summary>
+    /// Ищет свободный порт начиная с базового (9880): порт занят, если его уже
+    /// использует другой раздаваемый сканер
+    /// </summary>
     private int AllocatePort()
     {
         var used = _entries.Select(e => e.Port).Concat(_custom.Select(e => e.Port)).ToHashSet();
@@ -552,6 +633,7 @@ internal sealed class SharedDeviceCatalog : IDisposable
         return port;
     }
 
+    /// <summary>Очищает каталог при остановке службы (сервер останавливает ScanServer)</summary>
     public void Dispose()
     {
         // Сканеры снимаются при Stop()/Dispose() самого ScanServer
@@ -757,6 +839,7 @@ internal sealed class DeviceListHttpServer : IDisposable
         response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
     }
 
+    /// <summary>Останавливает управляющий HTTP-сервер и освобождает порт 9899</summary>
     public void Dispose()
     {
         _cts?.Cancel();

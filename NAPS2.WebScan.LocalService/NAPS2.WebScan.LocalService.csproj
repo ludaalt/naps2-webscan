@@ -1,21 +1,46 @@
 <Project Sdk="Microsoft.NET.Sdk.Worker">
 
+    <!--
+        NAPS2.WebScan.LocalService.csproj — «паспорт» проекта службы.
+
+        Что задаёт:
+          - TargetFramework: net8.0-windows — Windows-служба под .NET 8;
+          - RuntimeIdentifier/PlatformTarget: win-x64 — только 64-битная Windows;
+          - PublishSingleFile в Release — при публикации получается один exe;
+          - PackageReference — библиотеки NAPS2 (поиск сканеров, eSCL/WIA,
+            обработка изображений) и хостинг Windows-служб.
+
+        Сборка службы:
+          dotnet publish .\NAPS2.WebScan.LocalService.csproj -c Release -r win-x64 ^
+            (далее флаги self-contained true и PublishSingleFile=true) -o .\publish
+
+        Полученный publish\ затем упаковывается установщиком Inno Setup
+        (installer.iss) в NAPS2.WebScan.LocalService.Setup.exe.
+    -->
     <PropertyGroup>
+        <!-- Платформа: Windows + .NET 8 -->
         <TargetFramework>net8.0-windows</TargetFramework>
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
         <UserSecretsId>dotnet-NAPS2.WebScan.LocalService-FEFCA95A-331D-4C10-903D-4A4E7D1F4C65</UserSecretsId>
+        <!-- Серверный сборщик мусора: служба долгоживущая, это уменьшает паузы -->
         <ServerGarbageCollection>true</ServerGarbageCollection>
-        
+
+        <!-- Это приложение, а не библиотека -->
         <OutputType>exe</OutputType>
+        <!-- В Release собираем всё в один exe: на машине пользователя не нужен .NET -->
         <PublishSingleFile Condition="'$(Configuration)' == 'Release'">true</PublishSingleFile>
         <RuntimeIdentifier>win-x64</RuntimeIdentifier>
         <PlatformTarget>x64</PlatformTarget>
     </PropertyGroup>
 
     <ItemGroup>
+        <!-- Хостинг приложения и интеграция с диспетчером служб Windows -->
         <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
         <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+
+        <!-- NAPS2: eSCL-сервер (раздача сканеров браузеру), SDK сканирования
+             (поиск устройств, WIA/eSCL) и работа с изображениями -->
         <PackageReference Include="NAPS2.Escl.Server" Version="1.1.6" />
         <PackageReference Include="NAPS2.Images.ImageSharp" Version="1.1.6" />
         <PackageReference Include="NAPS2.Sdk" Version="1.1.6" />

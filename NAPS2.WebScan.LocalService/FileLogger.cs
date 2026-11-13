@@ -1,3 +1,17 @@
+// ============================================================================
+// FileLogger.cs: файловый журнал службы
+//
+// Что делает файл:
+//   - FileLoggerProvider подключается в Program.cs и создаёт FileLogger для
+//     каждой категории (служба, NAPS2.Scan, NAPS2.Escl.Server и т.д.);
+//   - пишет одновременно в два каталога: рядом с exe (logs\) и в
+//     %ProgramData%\NAPS2 WebScan Local Service\logs\;
+//   - LogFileWriter ведёт файл на каждый день (service-ГГГГ-ММ-ДД.log),
+//     удаляет старые и не роняет службу при ошибке записи
+//
+// Настройки: Logging:LogLevel:* и Logging:File:KeepDays в appsettings.json.
+// ============================================================================
+
 using System.Text;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;

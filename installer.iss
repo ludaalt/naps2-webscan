@@ -1,18 +1,40 @@
+; ============================================================================
+; installer.iss — скрипт сборки установщика для Inno Setup 6.
+;
+; Что делает:
+;   1. упаковывает содержимое publish\ (exe службы + appsettings.json)
+;      в один файл NAPS2.WebScan.LocalService.Setup.exe;
+;   2. при запуске Setup.exe создаёт каталог службы
+;      "C:\Program Files\NAPS2 WebScan Local Service" и копирует туда файлы;
+;   3. останавливает/удаляет старую версию службы, если она уже была;
+;   4. регистрирует службу "NAPS2.WebScan Service" с отложенным автозапуском
+;      и зависимостями от WIA (StiSvc) и RPC (RpcSs), включает перезапуск
+;      при сбоях и запускает службу;
+;   5. при удалении программы останавливает и удаляет службу.
+;
+; Сборка установщика (из корня репозитория, после dotnet publish):
+;   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" .\installer.iss
+; Результат: installer\NAPS2.WebScan.LocalService.Setup.exe
+; ============================================================================
+
 [Setup]
 AppName=NAPS2 WebScan Local Service
 AppVersion=1.0
+; Каталог установки создаётся автоматически: {autopf} = Program Files
 DefaultDirName={autopf}\NAPS2 WebScan Local Service
 DefaultGroupName=NAPS2 WebScan
+; Куда положить готовый Setup.exe
 OutputDir=.\installer
 OutputBaseFilename=NAPS2.WebScan.LocalService.Setup
 Compression=lzma2
 SolidCompression=yes
+; Установка требует прав администратора: служба ставится в Program Files
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 
 [Files]
-; Копируем все файлы из папки publish
+; Копируем всё, что собрал dotnet publish, в каталог службы {app}
 Source: "publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Run]
@@ -37,6 +59,8 @@ Filename: "{sys}\sc.exe"; Parameters: "stop ""NAPS2.WebScan Service"""; Flags: r
 Filename: "{sys}\sc.exe"; Parameters: "delete ""NAPS2.WebScan Service"""; Flags: runhidden
 
 [Code]
+// Проверка «служба уже существует»: нужна, чтобы stop/delete выполнялись
+// только при обновлении, а не при первой установке
 function ServiceExists(): Boolean;
 var
   ResultCode: Integer;
