@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+        WiaProbe.csproj — консольный пробник WIA для диагностики сканеров,
+        которые не сканируют через службу NAPS2.WebScan.
+
+        Зачем отдельный проект:
+          - повторяет ровно тот путь, которым сканирует служба
+            (NAPS2.Sdk 1.1.6 + NAPS2.Wia 2.0.3, тот же WiaScanDriver);
+          - позволяет перебрать матрицу настроек и увидеть, какая комбинация
+            (WIA 1.0/2.0, размер страницы, DPI, глубина цвета) даёт ошибку;
+          - умеет печатать свойства WIA-устройства и его item'ов, то есть
+            показывает, какие размеры и разрешения реально поддерживает драйвер.
+
+        Пробник не входит в установщик: publish\* собирается только из
+        NAPS2.WebScan.LocalService, поэтому на службу и на Setup.exe он не влияет.
+
+        Запуск: см. tools/WiaProbe/README.md
+    -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0-windows</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <!-- Служба 64-битная: пробник должен быть таким же, иначе драйвер
+             может вести себя иначе (часть WIA-драйверов только 32-битные) -->
+        <PlatformTarget>x64</PlatformTarget>
+        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <SelfContained>false</SelfContained>
+        <AssemblyName>WiaProbe</AssemblyName>
+        <RootNamespace>WiaProbe</RootNamespace>
+        <!-- Пробник — утилита диагностики, а не часть продукта -->
+        <IsPackable>false</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- Те же версии, что у службы: поведение драйвера должно совпадать -->
+        <PackageReference Include="NAPS2.Sdk" Version="1.1.6" />
+        <PackageReference Include="NAPS2.Images.ImageSharp" Version="1.1.6" />
+        <!-- Прямой доступ к WIA (свойства устройства и item'ов) -->
+        <PackageReference Include="NAPS2.Wia" Version="2.0.3" />
+        <!-- Журнал NAPS2 в консоль: видно "Error setting property" и т.п. -->
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+    </ItemGroup>
+
+</Project>
