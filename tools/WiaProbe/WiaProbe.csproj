@@ -31,9 +31,20 @@
         <RootNamespace>WiaProbe</RootNamespace>
         <!-- Пробник — утилита диагностики, а не часть продукта -->
         <IsPackable>false</IsPackable>
+        <!--
+            Версия в виде WiaProbe ГГГГММДД: дата берётся на момент сборки,
+            поэтому в отчёте видно, какой именно exe прислали. При публикации
+            дату можно задать явно: -p:BuildDate=20261117
+        -->
+        <BuildDate Condition="'$(BuildDate)' == ''">$([System.DateTime]::Now.ToString("yyyyMMdd"))</BuildDate>
     </PropertyGroup>
 
     <ItemGroup>
+        <!-- Дата сборки попадает в метаданные сборки, её читает AppVersion -->
+        <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+            <_Parameter1>BuildDate</_Parameter1>
+            <_Parameter2>$(BuildDate)</_Parameter2>
+        </AssemblyAttribute>
         <!-- Те же версии, что у службы: поведение драйвера должно совпадать -->
         <PackageReference Include="NAPS2.Sdk" Version="1.1.6" />
         <PackageReference Include="NAPS2.Images.ImageSharp" Version="1.1.6" />

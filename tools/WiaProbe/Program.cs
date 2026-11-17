@@ -94,38 +94,40 @@ internal static class Program
             return 0;
         }
 
-        // all всегда оставляет отчёт: это главный сценарий «прислать результат».
-        // Для остальных команд файл создаётся только по --log.
-        string? runDirectory = null;
+        if (cli.Command == "version")
+        {
+            Console.WriteLine(AppVersion.Display);
+            return 0;
+        }
+
+        // Отчёт пишут все команды, кроме help/version. Раньше report.txt
+        // создавался только у all, и с ПК с МФУ присылали «файлов нет».
+        // --log задаёт точный путь к отчёту, --out — базовую папку.
         var logPath = cli.LogPath;
-        if (cli.Command == "all")
+        string runDirectory;
+        if (string.IsNullOrWhiteSpace(logPath))
         {
-            if (string.IsNullOrWhiteSpace(logPath))
-            {
-                runDirectory = Path.Combine(Path.GetFullPath(cli.OutDir),
-                    $"wiaprobe-{DateTime.Now:yyyyMMdd-HHmmss}");
-                logPath = Path.Combine(runDirectory, "report.txt");
-            }
-            else
-            {
-                runDirectory = Path.GetDirectoryName(Path.GetFullPath(logPath));
-            }
+            runDirectory = NewRunDirectory(cli.OutDir);
+            logPath = Path.Combine(runDirectory, "report.txt");
+        }
+        else
+        {
+            runDirectory = Path.GetDirectoryName(Path.GetFullPath(logPath)) ?? cli.OutDir;
+        }
+
+        var reportOpened = Out.Open(logPath);
+        if (reportOpened && Out.FilePath != null)
+        {
+            // Если отчёт ушёл в запасную папку (не было прав), страницы
+            // сохраняем рядом с ним, а не в недоступный --out
+            runDirectory = Path.GetDirectoryName(Out.FilePath) ?? runDirectory;
         }
 
         try
         {
-            Out.Open(logPath);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Не удалось открыть отчёт: {ex.Message}");
-            Out.Close();
-        }
-
-        try
-        {
-            Out.Line($"WiaProbe: процесс {(Environment.Is64BitProcess ? "x64" : "x86")}, " +
+            Out.Line($"{AppVersion.Display}: процесс {(Environment.Is64BitProcess ? "x64" : "x86")}, " +
                      $"ОС {Environment.OSVersion.Version}, пользователь {Environment.UserName}");
+            Out.Line($"Папка результатов: {runDirectory}");
             if (Out.FilePath != null)
             {
                 Out.Line($"Отчёт: {Out.FilePath}");
@@ -154,7 +156,25 @@ internal static class Program
         }
     }
 
-    private static async Task<int> RunAsync(Cli cli, string? runDirectory)
+    /// <summary>
+    /// Папка запуска вида wiaprobe-ГГГГММДД-ЧЧММСС. Если такую уже создали
+    /// в эту же секунду (две команды подряд), добавляется суффикс -2, -3:
+    /// отчёты не должны затирать друг друга.
+    /// </summary>
+    private static string NewRunDirectory(string baseDirectory)
+    {
+        var root = Path.Combine(Path.GetFullPath(baseDirectory),
+            $"wiaprobe-{DateTime.Now:yyyyMMdd-HHmmss}");
+        var candidate = root;
+        for (var i = 2; Directory.Exists(candidate); i++)
+        {
+            candidate = $"{root}-{i}";
+        }
+
+        return candidate;
+    }
+
+    private static async Task<int> RunAsync(Cli cli, string runDirectory)
     {
         switch (cli.Command)
         {
@@ -163,14 +183,16 @@ internal static class Program
             case "dump":
                 return DumpDevices(cli);
             case "scan":
-                var scan = await ScanAsync(cli, cli.OutDir);
+                // Страницы WIA — в подпапку wia, отчёт — в корне запуска
+                var scan = await ScanAsync(cli, Path.Combine(runDirectory, "wia"));
                 return scan.Failed == 0 ? 0 : 1;
             case "service":
                 return await ServiceCommandAsync(cli);
             case "escl":
-                return await EsclCommandAsync(cli, cli.OutDir);
+                // Страницы eSCL — в подпапку escl, отчёт — в корне запуска
+                return await EsclCommandAsync(cli, Path.Combine(runDirectory, "escl"));
             case "all":
-                return await AllAsync(cli, runDirectory ?? Path.GetFullPath(cli.OutDir));
+                return await AllAsync(cli, runDirectory);
             default:
                 Console.Error.WriteLine($"Неизвестная команда: {cli.Command}");
                 PrintHelp();
@@ -1004,11 +1026,12 @@ internal static class Program
 
     private static void PrintHelp()
     {
+        Console.WriteLine($"{AppVersion.Display} — диагностика WIA-сканеров тем же кодом, " +
+                          "что и в службе NAPS2.WebScan.");
         Console.WriteLine("""
-            WiaProbe — диагностика WIA-сканеров тем же кодом, что и в службе NAPS2.WebScan.
 
             Использование:
-              WiaProbe all     [--device <часть имени>] [--no-scan] [--out <папка>] [--verbose]
+              WiaProbe [all]   [--device <часть имени>] [--no-scan] [--out <папка>] [--verbose]
               WiaProbe service [--service-port <порт>] [--log <файл>]
               WiaProbe escl    [--device <часть имени>] [--escl-port <порт>] [--no-scan]
                                [--size a4,letter] [--dpi 200,300] [--depth color,gray,bw]
@@ -1019,15 +1042,24 @@ internal static class Program
                                [--size a4,letter] [--dpi 200,300] [--depth color,gray,bw]
                                [--out <папка>] [--delay <мс>] [--timeout <с>]
                                [--native-ui] [--verbose]
+              WiaProbe --version
+
+            Если команда не указана (двойной клик по exe), выполняется all.
 
             Команды:
-              all      полная диагностика: среда, службы, PnP, WIA, eSCL, журнал, сканы.
-                       Всегда пишет отчёт report.txt в UTF-8 в папку wiaprobe-ГГГГММДД-ЧЧММСС
+              all      полная диагностика: среда, службы, PnP, WIA, eSCL, журнал, сканы
               service  только контекст: службы, PnP, ответ службы, журнал (без сканов)
               escl     сканирование через службу так, как это делает браузер
               list     перечислить WIA-устройства (через NAPS2.Sdk)
               dump     свойства устройства и item'ов + расчёт рамки XEXTENT/YEXTENT
               scan     матрица сканирований через WIA с сохранением страниц в PNG
+
+            Отчёт:
+              Любая команда, кроме help и --version, создаёт папку
+              .\wiaprobe-out\wiaprobe-ГГГГММДД-ЧЧММСС с файлом report.txt (UTF-8 с BOM).
+              Страницы: wia\*.png для WIA, escl\*.png для eSCL.
+              Если записать в --out нельзя, отчёт уходит в %TEMP%\WiaProbe —
+              точный путь печатается в консоли.
 
             Ключи:
               --device <текст>     фильтр по имени или ID
@@ -1035,21 +1067,23 @@ internal static class Program
               --size <список>      размеры: a4, letter (по умолчанию a4,letter), legal
               --dpi <список>       разрешения, по умолчанию 200
               --depth <список>     color (по умолчанию), gray, bw
-              --out <папка>        куда сохранять страницы и отчёт (.\wiaprobe-out)
+              --out <папка>        базовая папка для отчёта и страниц (.\wiaprobe-out)
               --delay <мс>         пауза между сканированиями (по умолчанию 2000)
               --timeout <с>        таймаут одного сканирования (по умолчанию 120)
               --escl-port <порт>   порт eSCL-раздачи вместо поиска через /devices
               --service-port <порт> порт списка сканеров службы (по умолчанию 9899)
-              --log <файл>         писать весь вывод в файл (UTF-8 с BOM)
+              --log <файл>         точный путь отчёта вместо папки wiaprobe-…
               --no-scan            только проверки без сканирования
               --native-ui          родной диалог драйвера (только в интерактивной сессии)
               --verbose            отладочный журнал NAPS2 (видно "Error setting property")
+              --version            напечатать версию (WiaProbe ГГГГММДД) и выйти
 
             Если вывод в консоли выглядит как "╨┐╤А╨╛╤Ж╨╡╤Б╤Б", это не ошибка
             сканера: так PowerShell перекодирует UTF-8. Смотрите report.txt —
             он всегда в UTF-8 и открывается без настроек.
 
             Примеры:
+              .\WiaProbe.exe
               .\WiaProbe.exe all
               .\WiaProbe.exe all --no-scan
               .\WiaProbe.exe service --log service.txt
@@ -1063,7 +1097,9 @@ internal static class Program
     /// <summary>Разобранные аргументы командной строки.</summary>
     private sealed class Cli
     {
-        public string Command { get; private set; } = "list";
+        // Без аргументов (двойной клик по exe) — полная диагностика:
+        // иначе пользователь запускает пробник и не понимает, где результат
+        public string Command { get; private set; } = "all";
         public string? Device { get; private set; }
         public List<WiaApiVersion> Versions { get; } = new() { WiaApiVersion.Wia20 };
         public List<(string Name, PageSize Size)> Sizes { get; private set; } =
@@ -1242,6 +1278,9 @@ internal static class Program
                     case "--help":
                     case "-h":
                         return new Cli { Command = "help" };
+                    case "--version":
+                    case "-v":
+                        return new Cli { Command = "version" };
                     default:
                         if (arg.StartsWith("--", StringComparison.Ordinal))
                         {
@@ -1258,7 +1297,7 @@ internal static class Program
                 cli.Command = positional[0].ToLowerInvariant();
             }
 
-            if (cli.Command is not ("list" or "dump" or "scan" or "service" or "escl" or "all" or "help"))
+            if (cli.Command is not ("list" or "dump" or "scan" or "service" or "escl" or "all" or "help" or "version"))
             {
                 throw new ArgumentException($"неизвестная команда: {cli.Command}");
             }

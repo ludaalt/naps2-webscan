@@ -18,14 +18,49 @@ internal static class Out
     /// <summary>Путь отчётного файла, если он открыт</summary>
     public static string? FilePath { get; private set; }
 
-    /// <summary>Открывает отчётный файл (перезаписывает существующий)</summary>
-    public static void Open(string? path)
+    /// <summary>
+    /// Открывает отчётный файл (перезаписывает существующий).
+    /// Если записать по указанному пути нельзя (нет прав, диск только для
+    /// чтения), отчёт уводится во временную папку: файл должен появиться
+    /// в любом случае, иначе с ПК с МФУ нечего прислать.
+    /// </summary>
+    /// <returns>true, если отчёт удалось открыть</returns>
+    public static bool Open(string? path)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
-            return;
+            return false;
         }
 
+        try
+        {
+            OpenCore(path);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var fallback = Path.Combine(Path.GetTempPath(), "WiaProbe",
+                $"wiaprobe-{DateTime.Now:yyyyMMdd-HHmmss}", "report.txt");
+            try
+            {
+                OpenCore(fallback);
+                Console.Error.WriteLine(
+                    $"Не удалось создать отчёт по пути {Path.GetFullPath(path)}: {ex.Message}");
+                Console.Error.WriteLine($"Отчёт сохранён во временную папку: {FilePath}");
+                return true;
+            }
+            catch (Exception fallbackEx)
+            {
+                Console.Error.WriteLine(
+                    $"Не удалось открыть отчёт: {ex.Message}; " +
+                    $"запасной путь тоже не сработал: {fallbackEx.Message}");
+                return false;
+            }
+        }
+    }
+
+    private static void OpenCore(string path)
+    {
         var full = Path.GetFullPath(path);
         var directory = Path.GetDirectoryName(full);
         if (!string.IsNullOrEmpty(directory))
