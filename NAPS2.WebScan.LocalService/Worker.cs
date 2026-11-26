@@ -357,7 +357,7 @@ public class Worker : BackgroundService
 /// </summary>
 internal sealed class SharedDeviceCatalog : IDisposable
 {
-    private sealed record Entry(ScanDevice Device, string DisplayName, int Port);
+    private sealed record Entry(ScanDevice Device, string DisplayName, int Port, string[] Sources);
 
     private readonly ScanServer _scanServer;
     private readonly ILogger _logger;
@@ -398,7 +398,7 @@ internal sealed class SharedDeviceCatalog : IDisposable
     /// <summary>Снимок расшаренных сканеров для управляющего JSON-эндпоинта</summary>
     public IReadOnlyList<SharedDeviceInfo> Snapshot() =>
         _entries.Concat(_custom)
-            .Select(e => new SharedDeviceInfo(e.Device.ID, e.DisplayName, e.Device.Driver.ToString(), e.Port))
+            .Select(e => new SharedDeviceInfo(e.Device.ID, e.DisplayName, e.Device.Driver.ToString(), e.Port, e.Sources ?? Array.Empty<string>()))
             .ToList();
 
     /// <summary>
@@ -416,14 +416,14 @@ internal sealed class SharedDeviceCatalog : IDisposable
             return new AddDeviceResult(false, null, "Адрес не задан");
         }
 
-        using var response = await ProbeAsync($"{url}/ScannerCapabilities");
+        // Проверяем доступность eSCL и пытаемся получить список источников (планшет/лоток) из ScannerCapabilities
+        var (response, sources) = await ProbeEsclCapabilitiesAsync(url);
         if (response == null)
         {
             return new AddDeviceResult(false, null, "МФУ не отвечает по eSCL");
         }
         if (!response.IsSuccessStatusCode)
         {
-            // 404 чаще всего значит неверный путь: у МФУ он /eSCL, и регистр важен
             var hint = response.StatusCode == HttpStatusCode.NotFound
                 ? " (проверьте путь eSCL, обычно /eSCL)"
                 : "";
@@ -442,14 +442,14 @@ internal sealed class SharedDeviceCatalog : IDisposable
         var device = new ScanDevice(Driver.Escl, url, url);
         var port = AllocatePort();
         _scanServer.RegisterDevice(device, device.Name, port);
-        _custom.Add(new Entry(device, device.Name, port));
+        _custom.Add(new Entry(device, device.Name, port, sources));
         _pendingUrls.Remove(url);
-        _logger.LogInformation("Добавлен сканер по адресу: {Url} (порт {Port})", url, port);
+        _logger.LogInformation("Добавлен сканер по адресу: {Url} (порт {Port}, sources: {Sources})", url, port, string.Join(",", sources));
 
         await EnsureStartedAsync();
         await SaveCustomScannersAsync();
         return new AddDeviceResult(true,
-            new SharedDeviceInfo(device.ID, device.Name, device.Driver.ToString(), port), null);
+            new SharedDeviceInfo(device.ID, device.Name, device.Driver.ToString(), port, sources), null);
     }
 
     /// <summary>Восстанавливает сохранённые адреса при старте службы</summary>
@@ -573,9 +573,23 @@ internal sealed class SharedDeviceCatalog : IDisposable
                 continue;
             }
             var port = AllocatePort();
+            // По умолчанию считаем только планшет; для eSCL пробуем уточнить по ScannerCapabilities
+            var sources = new[] { "flatbed" };
+            if (device.Driver == Driver.Escl)
+            {
+                // Для сетевых/обнаруженных по eSCL устройств пытаемся прочитать источники из ScannerCapabilities
+                var probeUrl = Worker.NormalizeUrl(device.ID) ?? device.ID;
+                var (_, detected) = await ProbeEsclCapabilitiesAsync(probeUrl);
+                sources = detected;
+            }
+            else if (device.Driver == Driver.Wia)
+            {
+                // Для WIA (USB) точная детекция источников через NAPS2 API здесь недоступна; оставляем дефолт "flatbed"
+                sources = new[] { "flatbed" };
+            }
             _scanServer.RegisterDevice(device, device.Name, port);
-            _entries.Add(new Entry(device, device.Name, port));
-            _logger.LogInformation("Раздаю сканер: {Name} на порту {Port} ({Id})", device.Name, port, device.ID);
+            _entries.Add(new Entry(device, device.Name, port, sources));
+            _logger.LogInformation("Раздаю сканер: {Name} на порту {Port} ({Id}), sources: {Sources}", device.Name, port, device.ID, string.Join(",", sources));
         }
 
         await EnsureStartedAsync();
@@ -592,30 +606,80 @@ internal sealed class SharedDeviceCatalog : IDisposable
         }
     }
 
-    private async Task<HttpResponseMessage?> ProbeAsync(string url)
+    // Пытаемся понять, какие источники бумаги поддерживает устройство, по XML ScannerCapabilities (eSCL)
+    private static string[] DetectSourcesFromEsclXml(string xml)
     {
+        var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Ищем элементы InputSource, например <pwg:InputSource>Platen</pwg:InputSource> или <scan:InputSource>Feeder</scan:InputSource>
+        var matches = System.Text.RegularExpressions.Regex.Matches(
+            xml,
+            "<[^:>]*:?InputSource>([^<]+)</[^:>]*:?InputSource>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        foreach (System.Text.RegularExpressions.Match m in matches)
+        {
+            var v = m.Groups[1].Value.Trim().ToLowerInvariant();
+            // Platen/Flatbed - это планшет (сканирование листа/страницы с планшета)
+            if (v.Contains("platen") || v.Contains("flatbed")) sources.Add("flatbed");
+            // Feeder/ADF/Duplex - податчик/лоток (автоматическая подача листов; duplex = двусторонний лоток)
+            if (v.Contains("feeder") || v.Contains("adf") || v.Contains("duplex")) sources.Add("feeder");
+        }
+        if (sources.Count == 0)
+        {
+            // Если в XML ничего не нашли (часто бывает шаблонный ответ), выбираем безопасный вариант
+            // Примечание: для точной детекции WIA/частных драйверов этого может быть недостаточно
+            sources.Add("flatbed");
+        }
+        // Сначала планшет, потом лоток
+        return sources.OrderBy(s => s == "flatbed" ? 0 : 1).ToArray();
+    }
+
+    // Запрашиваем ScannerCapabilities по eSCL и извлекаем список источников (sources)
+    private async Task<(HttpResponseMessage? Response, string[] Sources)> ProbeEsclCapabilitiesAsync(string baseUrl)
+    {
+        // Собираем URL вида .../eSCL/ScannerCapabilities (учитываем, что baseUrl может уже заканчиваться на /eSCL)
+        var capUrl = baseUrl.EndsWith("/eSCL", StringComparison.OrdinalIgnoreCase) || baseUrl.EndsWith("/eSCL/", StringComparison.OrdinalIgnoreCase)
+            ? baseUrl.TrimEnd('/') + "/ScannerCapabilities"
+            : baseUrl + "/eSCL/ScannerCapabilities";
         try
         {
-            var response = await _probeClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-            // адрес снова отвечает: следующая ошибка опять будет показана подробно
-            _lastProbeFailure.Remove(url);
-            return response;
+            var response = await _probeClient.GetAsync(capUrl, HttpCompletionOption.ResponseHeadersRead);
+            _lastProbeFailure.Remove(capUrl);
+            if (response != null && response.IsSuccessStatusCode)
+            {
+                try
+                {
+                    var xml = await response.Content.ReadAsStringAsync();
+                    var sources = DetectSourcesFromEsclXml(xml);
+                    return (response, sources);
+                }
+                catch
+                {
+                    // Если не удалось разобрать XML - отдаём безопасный вариант
+                    return (response, new[] { "flatbed" });
+                }
+            }
+            return (response, new[] { "flatbed" });
         }
         catch (Exception ex)
         {
             var reason = $"{ex.GetType().Name}: {ex.Message}";
-            if (_lastProbeFailure.TryGetValue(url, out var previous) && previous == reason)
+            if (_lastProbeFailure.TryGetValue(capUrl, out var previous) && previous == reason)
             {
-                // та же ошибка, что и в прошлый раз: подробности уже есть в журнале
-                _logger.LogTrace("Проверка доступности сканера снова не удалась: {Url}", url);
+                _logger.LogTrace("Проверка доступности сканера снова не удалась: {Url}", capUrl);
             }
             else
             {
-                _lastProbeFailure[url] = reason;
-                _logger.LogDebug(ex, "Проверка доступности сканера не удалась: {Url}", url);
+                _lastProbeFailure[capUrl] = reason;
+                _logger.LogDebug(ex, "Проверка доступности сканера не удалась: {Url}", capUrl);
             }
-            return null;
+            return (null, new[] { "flatbed" });
         }
+    }
+
+    private async Task<HttpResponseMessage?> ProbeAsync(string url)
+    {
+        var (resp, _) = await ProbeEsclCapabilitiesAsync(url);
+        return resp;
     }
 
     /// <summary>
@@ -643,8 +707,7 @@ internal sealed class SharedDeviceCatalog : IDisposable
 }
 
 /// <summary>Описание расшаренного сканера для списка в браузере</summary>
-internal sealed record SharedDeviceInfo(string Id, string Name, string Driver, int Port);
-
+internal sealed record SharedDeviceInfo(string Id, string Name, string Driver, int Port, string[] Sources);
 /// <summary>Результат добавления сканера по адресу (POST /devices)</summary>
 internal sealed record AddDeviceResult(bool Ok, SharedDeviceInfo? Device, string? Error);
 
